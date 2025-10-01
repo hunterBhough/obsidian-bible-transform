@@ -347,6 +347,49 @@ func doLexiconJob(cfg Config, inputFile string, aliasMap map[string]string, logg
 	return nil
 }
 
+// split input into paragraphs separated by one or more blank lines
+func splitParagraphs(s string) []string {
+	s = normalizeNewlines(s)
+	lines := strings.Split(s, "\n")
+	var paras []string
+	var buf []string
+	flush := func() {
+		if len(buf) > 0 {
+			paras = append(paras, strings.Join(buf, "\n"))
+			buf = buf[:0]
+		}
+	}
+	for _, ln := range lines {
+		if strings.TrimSpace(ln) == "" {
+			flush()
+		} else {
+			buf = append(buf, ln)
+		}
+	}
+	flush()
+	return paras
+}
+
+// extractBlockByID returns the paragraph whose last non-empty line ends with ^<id>, with the trailing block id removed.
+func extractBlockByID(body, id string) (string, bool) {
+	paras := splitParagraphs(body)
+	suffix := "^" + id
+	for _, p := range paras {
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
+		lines := strings.Split(p, "\n")
+		last := strings.TrimRight(lines[len(lines)-1], " \t")
+		if strings.HasSuffix(last, suffix) {
+			// remove the "^id" and trailing whitespace
+			last = strings.TrimRight(strings.TrimSuffix(last, suffix), " \t")
+			lines[len(lines)-1] = last
+			return strings.Join(lines, "\n"), true
+		}
+	}
+	return "", false
+}
+
 func doChapterJob(cfg Config, chapterDir string, aliasMap map[string]string, logger *Logger, stats *Stats) error {
 	// 1) identify chapter file and verse files in the directory
 	entries, err := os.ReadDir(chapterDir)
@@ -464,25 +507,61 @@ func doChapterJob(cfg Config, chapterDir string, aliasMap map[string]string, log
 		outVerse := filepath.Join(cfg.OutputParent, chapterRelDir, verseStem+inferredExt)
 
 		planned, action, err := writeBytesIfChanged(cfg, outVerse, func() ([]byte, error) {
+			// 1) Read the INPUT verse file (source of truth for KJV text)
 			var fm string
+			var inBody string
 			if inputVersePath != "" {
 				b, err := os.ReadFile(inputVersePath)
 				if err != nil {
 					return nil, err
 				}
-				fm, _ = splitYAMLFrontMatter(string(b))
+				fm, inBody = splitYAMLFrontMatter(string(b))
 			}
-			original := strings.TrimSpace(vb.Content)
-			// KJV: keep original (no alias rewrite), mark as ^kjv
-			kjvBody := ensureBlockIDAtEOL(original, "kjv")
-			// Transliteration: alias-rewritten, mark as ^kjv-transliteration
-			translitBody, rew := rewriteLinks(original, aliasMap)
-			if rew > 0 {
-				stats.linksRewritt.Add(int64(rew))
+
+			// 2) Determine KJV base:
+			// Prefer the ^kjv paragraph from the INPUT verse file if present; else the whole input body;
+			// if still empty (file missing/empty), fall back to chapter-extracted text.
+			var base string
+			if para, ok := extractBlockByID(inBody, "kjv"); ok {
+				base = strings.TrimSpace(para)
+			} else if strings.TrimSpace(inBody) != "" {
+				base = strings.TrimSpace(inBody)
+			} else {
+				base = strings.TrimSpace(vb.Content)
 			}
-			translitBody = ensureBlockIDAtEOL(translitBody, "kjv-transliteration")
-			// Compose: YAML front matter + KJV + Transliteration
-			// Ensure exactly one blank line between ^kjv and ^kjv-transliteration blocks.
+
+			// 3) Determine transliteration paragraph to preserve:
+			// Prefer an already-existing ^kjv-transliteration in the OUTPUT (idempotent reruns),
+			// else one in the INPUT (if present), else generate from base via alias rewrite.
+			var preservedTranslit string
+
+			if outBytes, err := os.ReadFile(outVerse); err == nil {
+				_, outBody := splitYAMLFrontMatter(string(outBytes))
+				if para, ok := extractBlockByID(outBody, "kjv-transliteration"); ok {
+					preservedTranslit = strings.TrimSpace(para)
+				}
+			}
+			if preservedTranslit == "" {
+				if para, ok := extractBlockByID(inBody, "kjv-transliteration"); ok {
+					preservedTranslit = strings.TrimSpace(para)
+				}
+			}
+
+			var translitBody string
+			if preservedTranslit != "" {
+				translitBody = ensureBlockIDAtEOL(preservedTranslit, "kjv-transliteration")
+			} else {
+				gen, rew := rewriteLinks(base, aliasMap)
+				if rew > 0 {
+					stats.linksRewritt.Add(int64(rew))
+				}
+				translitBody = ensureBlockIDAtEOL(gen, "kjv-transliteration")
+			}
+
+			// 4) Rebuild KJV paragraph ONLY from the base
+			kjvBody := ensureBlockIDAtEOL(base, "kjv")
+
+			// 5) Compose: YAML + KJV + blank line + Transliteration
 			full := fm + kjvBody + "\n" + translitBody
 			full = ensureEndsWithNewline(full)
 			return []byte(full), nil
