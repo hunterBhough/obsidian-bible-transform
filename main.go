@@ -64,6 +64,9 @@ var (
 	trailingBlockIDRe = regexp.MustCompile(`(?m)(?:^|\s)\^([A-Za-z0-9\-_]+)\s*$`)
 	blockIDLineOnlyRe = regexp.MustCompile(`(?m)^\s*\^[A-Za-z0-9\-_]+\s*$`)
 	blockIDAtEOLRe    = regexp.MustCompile(`\s*\^[A-Za-z0-9\-_]+$`)
+	// Matches simple chapter links like [[Exodus 3]] or [[Exodus 3|→]] anywhere in a line
+	// (No dot/hash in target; ends with a number; avoids verse links like Genesis 2.1)
+	chapterLinkRe = regexp.MustCompile(`\[\[([^\]|#\n]+?\s\d+)(\|[^]]+)?\]\]`)
 )
 
 type VerseBlock struct {
@@ -320,6 +323,23 @@ func doCopyJob(cfg Config, inputFile string, aliasMap map[string]string, logger 
 	logWrite(logger, action, outPath, planned)
 	incrementFileStat(stats, action)
 	return nil
+}
+
+// rewriteChapterLinksToTranslit rewrites links like [[Book 3]] or [[Book 3|→]]
+// to [[Book 3-kjv-transliteration]] (preserving any alias), and counts rewrites.
+func rewriteChapterLinksToTranslit(s string) (string, int) {
+	count := 0
+	out := chapterLinkRe.ReplaceAllStringFunc(s, func(m string) string {
+		sub := chapterLinkRe.FindStringSubmatch(m)
+		target := strings.TrimSpace(sub[1]) // e.g., "Exodus 3"
+		alias := sub[2]                     // e.g., "|→" or empty; includes leading '|'
+		if strings.HasSuffix(target, "-kjv-transliteration") {
+			return m // already correct
+		}
+		count++
+		return "[[" + target + "-kjv-transliteration" + alias + "]]"
+	})
+	return out, count
 }
 
 func doLexiconJob(cfg Config, inputFile string, aliasMap map[string]string, logger *Logger, stats *Stats) error {
@@ -594,7 +614,11 @@ func doChapterJob(cfg Config, chapterDir string, aliasMap map[string]string, log
 	translitChapterName := chapterBase + "-kjv-transliteration" + ext
 	outChapterTranslit := filepath.Join(cfg.OutputParent, chapterRelDir, translitChapterName)
 	plannedT, actionT, err := writeBytesIfChanged(cfg, outChapterTranslit, func() ([]byte, error) {
-		out := ensureEndsWithNewline(replacedTranslit)
+		rebased, rew := rewriteChapterLinksToTranslit(replacedTranslit)
+		if rew > 0 {
+			stats.linksRewritt.Add(int64(rew))
+		}
+		out := ensureEndsWithNewline(rebased)
 		return []byte(out), nil
 	}, false)
 	if err != nil {
