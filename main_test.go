@@ -28,8 +28,12 @@ Tail.
 	}
 	want := `Intro line
 
+### 1
 ![[Genesis 1.1#^kjv]]
+
+### 2
 ![[Genesis 1.2#^kjv]]
+
 Tail.
 `
 	if replaced != want {

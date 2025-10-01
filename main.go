@@ -57,9 +57,9 @@ type Stats struct {
 var (
 	verseHeaderRe = regexp.MustCompile(`(?m)^###\s+(\d+)\b.*$`)
 	h2AliasRe     = regexp.MustCompile(`(?m)^##\s+(.+)$`)
-	// Matches [[H123]] or [[H123|...]] or Greek variants
-	// Raw string (recommended)
-	linkRe = regexp.MustCompile(`\[\[(H|G)\d+(?:\|[^\]]+)?\]\]`)
+	// Matches [[H123]] / [[G123]] and with alias: [[H123|...]] / [[G123|...]]
+	// Capture group 1 = full code (e.g., H7225 or G3056)
+	linkRe = regexp.MustCompile(`\[\[((H|G)\d+)(?:\|[^]]+)?\]\]`)
 	// block id at line end like ^something
 	trailingBlockIDRe = regexp.MustCompile(`(?m)(?:^|\s)\^([A-Za-z0-9\-_]+)\s*$`)
 	blockIDLineOnlyRe = regexp.MustCompile(`(?m)^\s*\^[A-Za-z0-9\-_]+\s*$`)
@@ -120,7 +120,7 @@ func main() {
 			for job := range jobs {
 				switch job.Typ {
 				case JobCopy:
-					if err := doCopyJob(cfg, job.Path, logger, stats); err != nil {
+					if err := doCopyJob(cfg, job.Path, aliasMap, logger, stats); err != nil {
 						logger.Printf("[ERROR] copy: %s: %v", job.Path, err)
 					}
 				case JobLexicon:
@@ -165,15 +165,15 @@ func main() {
 
 func parseFlags() Config {
 	var cfg Config
-	flag.StringVar(&cfg.InputParent, "input-parent", "KJV_Tagged_Lexicon", "Input parent directory")
-	flag.StringVar(&cfg.OutputParent, "output-parent", "vault_modified", "Output parent directory")
+	flag.StringVar(&cfg.InputParent, "input-parent", "inputs/KJV_Tagged_Lexicon", "Input parent directory")
+	flag.StringVar(&cfg.OutputParent, "output-parent", "outputs/vault_modified", "Output parent directory")
 	flag.BoolVar(&cfg.DryRun, "dry-run", true, "If true, plan only (no writes except log directory)")
 	flag.IntVar(&cfg.Workers, "workers", 8, "Number of concurrent workers")
-	defLog := filepath.Join("vault_modified", "transform.log")
+	defLog := filepath.Join("outputs/vault_modified", "transform.log")
 	flag.StringVar(&cfg.LogFile, "log-file", defLog, "Path to log file (default <output-parent>/transform.log)")
 	flag.Parse()
 	// if log-file still default but output-parent changed, align it
-	if cfg.LogFile == defLog && cfg.OutputParent != "vault_modified" {
+	if cfg.LogFile == defLog && cfg.OutputParent != "outputs/vault_modified" {
 		cfg.LogFile = filepath.Join(cfg.OutputParent, "transform.log")
 	}
 	return cfg
@@ -292,13 +292,28 @@ func extractFirstH2Alias(s string) string {
 
 // ===== Workers =====
 
-func doCopyJob(cfg Config, inputFile string, logger *Logger, stats *Stats) error {
+func doCopyJob(cfg Config, inputFile string, aliasMap map[string]string, logger *Logger, stats *Stats) error {
 	rel, _ := filepath.Rel(cfg.InputParent, inputFile)
 	outPath := filepath.Join(cfg.OutputParent, rel)
 
 	planned, action, err := writeBytesIfChanged(cfg, outPath, func() ([]byte, error) {
-		return os.ReadFile(inputFile)
-	}, true /* byteForByte */)
+		b, err := os.ReadFile(inputFile)
+		if err != nil {
+			return nil, err
+		}
+		ext := strings.ToLower(filepath.Ext(inputFile))
+		if ext == ".md" {
+			body := normalizeNewlines(string(b))
+			body = ensureEndsWithNewline(body)
+			newBody, rew := rewriteLinks(body, aliasMap)
+			if rew > 0 {
+				stats.linksRewritt.Add(int64(rew))
+			}
+			return []byte(newBody), nil
+		}
+		// Non-markdown: copy byte-for-byte
+		return b, nil
+	}, strings.ToLower(filepath.Ext(inputFile)) != ".md")
 	if err != nil {
 		return err
 	}
@@ -342,23 +357,78 @@ func doChapterJob(cfg Config, chapterDir string, aliasMap map[string]string, log
 	var chapterBase string
 	var ext string
 
-	// find the file whose basename (without extension) contains no dot
+	// find chapter file candidates: basename (without extension) contains no dot
+	var chapterCandidates []string
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
 		base := strings.TrimSuffix(e.Name(), filepath.Ext(e.Name()))
 		if !strings.Contains(base, ".") {
-			if chapterFile != "" {
-				return fmt.Errorf("multiple candidate chapter files in %s", chapterDir)
-			}
-			chapterFile = filepath.Join(chapterDir, e.Name())
-			chapterBase = base
-			ext = filepath.Ext(e.Name())
+			chapterCandidates = append(chapterCandidates, filepath.Join(chapterDir, e.Name()))
 		}
 	}
-	if chapterFile == "" {
-		return fmt.Errorf("no chapter file in %s", chapterDir)
+	if len(chapterCandidates) == 0 {
+		logger.Printf("[WARN] no chapter file detected in %s — falling back to mirror copy", chapterDir)
+		return mirrorDirWithMarkdownRewrite(cfg, chapterDir, aliasMap, logger, stats)
+	}
+
+	dirBase := filepath.Base(chapterDir) // e.g., "Psalm 1"
+	type cand struct{ path, base, ext string }
+	cands := make([]cand, 0, len(chapterCandidates))
+	for _, p := range chapterCandidates {
+		cands = append(cands, cand{
+			path: p,
+			base: strings.TrimSuffix(filepath.Base(p), filepath.Ext(p)),
+			ext:  strings.ToLower(filepath.Ext(p)),
+		})
+	}
+
+	// Prefer candidates whose basename matches the chapter directory
+	var match []cand
+	for _, c := range cands {
+		if c.base == dirBase {
+			match = append(match, c)
+		}
+	}
+
+	pick := func(list []cand) cand {
+		// Prefer .md, else the first in lexicographic order
+		best := list[0]
+		for _, c := range list[1:] {
+			if c.ext == ".md" && best.ext != ".md" {
+				best = c
+				continue
+			}
+			if c.ext == best.ext && c.path < best.path {
+				best = c
+			}
+		}
+		return best
+	}
+
+	switch {
+	case len(match) == 1:
+		chosen := match[0]
+		chapterFile = chosen.path
+		chapterBase = chosen.base
+		ext = chosen.ext
+	case len(match) > 1:
+		chosen := pick(match)
+		logger.Printf("[WARN] multiple matching chapter files in %s (by dir name). Picking %s among %v", chapterDir, chosen.path, chapterCandidates)
+		chapterFile = chosen.path
+		chapterBase = chosen.base
+		ext = chosen.ext
+	case len(chapterCandidates) == 1:
+		// Only one candidate overall; accept it
+		only := cands[0]
+		chapterFile = only.path
+		chapterBase = only.base
+		ext = only.ext
+	default:
+		// Multiple overall, none match dirBase -> ambiguous; fall back to mirror
+		logger.Printf("[WARN] multiple candidate chapter files in %s — falling back to mirror copy: %v", chapterDir, chapterCandidates)
+		return mirrorDirWithMarkdownRewrite(cfg, chapterDir, aliasMap, logger, stats)
 	}
 
 	stats.chapters.Add(1)
@@ -692,4 +762,51 @@ func firstLineMatch(r io.Reader, re *regexp.Regexp) string {
 		}
 	}
 	return ""
+}
+
+// mirrorDirWithMarkdownRewrite mirrors a directory subtree from input to output.
+// Markdown files are rewritten with lexicon aliases; other files are copied byte-for-byte.
+func mirrorDirWithMarkdownRewrite(cfg Config, srcDir string, aliasMap map[string]string, logger *Logger, stats *Stats) error {
+	return filepath.WalkDir(srcDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, _ := filepath.Rel(cfg.InputParent, path)
+		outPath := filepath.Join(cfg.OutputParent, rel)
+
+		if d.IsDir() {
+			if cfg.DryRun {
+				logger.Printf("[PLAN-MKDIR] %s", outPath)
+				return nil
+			}
+			if err := os.MkdirAll(outPath, 0o755); err != nil {
+				return err
+			}
+			logger.Printf("[MKDIR] %s", outPath)
+			return nil
+		}
+
+		planned, action, err := writeBytesIfChanged(cfg, outPath, func() ([]byte, error) {
+			b, err := os.ReadFile(path)
+			if err != nil {
+				return nil, err
+			}
+			if strings.ToLower(filepath.Ext(path)) == ".md" {
+				body := normalizeNewlines(string(b))
+				body = ensureEndsWithNewline(body)
+				newBody, rew := rewriteLinks(body, aliasMap)
+				if rew > 0 {
+					stats.linksRewritt.Add(int64(rew))
+				}
+				return []byte(newBody), nil
+			}
+			return b, nil
+		}, strings.ToLower(filepath.Ext(path)) != ".md")
+		if err != nil {
+			return err
+		}
+		logWrite(logger, action, outPath, planned)
+		incrementFileStat(stats, action)
+		return nil
+	})
 }
