@@ -438,9 +438,14 @@ func doChapterJob(cfg Config, chapterDir string, aliasMap map[string]string, log
 		return fmt.Errorf("read chapter: %w", err)
 	}
 	chStr := normalizeNewlines(string(chapterBytes))
-	blocks, replaced, err := transformChapterContent(chStr, chapterBase)
+	blocks, replacedTranslit, err := transformChapterContent(chStr, chapterBase, "kjv-transliteration")
 	if err != nil {
 		return fmt.Errorf("parse chapter: %w", err)
+	}
+	// Also render a KJV-only chapter variant with ^kjv embeds
+	_, replacedKJV, err := transformChapterContent(chStr, chapterBase, "kjv")
+	if err != nil {
+		return fmt.Errorf("parse chapter (kjv variant): %w", err)
 	}
 
 	// 3) For each verse, update or create the corresponding verse file
@@ -467,16 +472,18 @@ func doChapterJob(cfg Config, chapterDir string, aliasMap map[string]string, log
 				}
 				fm, _ = splitYAMLFrontMatter(string(b))
 			}
-			body := strings.TrimSpace(vb.Content)
-			// ensure single trailing newline and ^kjv as final token
-			body = ensureBlockIDAtEOL(body, "kjv")
-			// rewrite lexicon links in the non-YAML segment
-			body, rew := rewriteLinks(body, aliasMap)
+			original := strings.TrimSpace(vb.Content)
+			// KJV: keep original (no alias rewrite), mark as ^kjv
+			kjvBody := ensureBlockIDAtEOL(original, "kjv")
+			// Transliteration: alias-rewritten, mark as ^kjv-transliteration
+			translitBody, rew := rewriteLinks(original, aliasMap)
 			if rew > 0 {
 				stats.linksRewritt.Add(int64(rew))
 			}
-
-			full := fm + body
+			translitBody = ensureBlockIDAtEOL(translitBody, "kjv-transliteration")
+			// Compose: YAML front matter + KJV + Transliteration
+			// Ensure exactly one blank line between ^kjv and ^kjv-transliteration blocks.
+			full := fm + kjvBody + "\n" + translitBody
 			full = ensureEndsWithNewline(full)
 			return []byte(full), nil
 		}, false)
@@ -487,19 +494,36 @@ func doChapterJob(cfg Config, chapterDir string, aliasMap map[string]string, log
 		incrementFileStat(stats, action)
 	}
 
-	// 4) Write transformed chapter file to output
-	relChapter, _ := filepath.Rel(cfg.InputParent, chapterFile)
-	outChapter := filepath.Join(cfg.OutputParent, relChapter)
+	// 4) Write transformed chapter files to output
 
-	planned, action, err := writeBytesIfChanged(cfg, outChapter, func() ([]byte, error) {
-		out := ensureEndsWithNewline(replaced)
+	// Default (unsuffixed) chapter: write the KJV embeds
+	relChapter, _ := filepath.Rel(cfg.InputParent, chapterFile)
+	outChapterDefault := filepath.Join(cfg.OutputParent, relChapter)
+	plannedDef, actionDef, err := writeBytesIfChanged(cfg, outChapterDefault, func() ([]byte, error) {
+		out := ensureEndsWithNewline(replacedKJV)
 		return []byte(out), nil
 	}, false)
 	if err != nil {
 		return err
 	}
-	logWrite(logger, action, outChapter, planned)
-	incrementFileStat(stats, action)
+	logWrite(logger, actionDef, outChapterDefault, plannedDef)
+	incrementFileStat(stats, actionDef)
+
+	// Transliteration chapter as "<ChapterBase>-kjv-transliteration<ext>"
+	relIn, _ := filepath.Rel(cfg.InputParent, chapterFile)
+	chapterRelDir := filepath.Dir(relIn)
+	translitChapterName := chapterBase + "-kjv-transliteration" + ext
+	outChapterTranslit := filepath.Join(cfg.OutputParent, chapterRelDir, translitChapterName)
+	plannedT, actionT, err := writeBytesIfChanged(cfg, outChapterTranslit, func() ([]byte, error) {
+		out := ensureEndsWithNewline(replacedTranslit)
+		return []byte(out), nil
+	}, false)
+	if err != nil {
+		return err
+	}
+	logWrite(logger, actionT, outChapterTranslit, plannedT)
+	incrementFileStat(stats, actionT)
+
 	return nil
 }
 
@@ -531,7 +555,7 @@ func findVerseFileInDir(entries []fs.DirEntry, dir, stem, preferredExt string) (
 
 // ===== Content transforms =====
 
-func transformChapterContent(chapter string, chapterBase string) (blocks []VerseBlock, replaced string, err error) {
+func transformChapterContent(chapter string, chapterBase string, embedID string) (blocks []VerseBlock, replaced string, err error) {
 	idxs := verseHeaderRe.FindAllStringSubmatchIndex(chapter, -1)
 	if len(idxs) == 0 {
 		// no verse headers; return unchanged
@@ -561,7 +585,7 @@ func transformChapterContent(chapter string, chapterBase string) (blocks []Verse
 
 		// Keep the verse header as "### <N>" (normalized), then the embed, then a blank line
 		out.WriteString(fmt.Sprintf("### %d\n", num))
-		out.WriteString(fmt.Sprintf("![[%s.%d#^kjv]]\n\n", chapterBase, num))
+		out.WriteString(fmt.Sprintf("![[%s.%d#^%s]]\n\n", chapterBase, num, embedID))
 
 		// Save the block for verse-file extraction (content after header line)
 		// Header line ends at fullEnd; content starts at fullEnd (which is right before the newline),
@@ -741,7 +765,7 @@ func ternary[T any](cond bool, a, b T) T {
 // Parse all verse blocks and return replaced content (embed links)
 // Exposed for tests.
 func ParseAndReplaceChapter(chapter, chapterBase string) ([]VerseBlock, string, error) {
-	return transformChapterContent(chapter, chapterBase)
+	return transformChapterContent(chapter, chapterBase, "kjv")
 }
 
 func SplitYAMLFrontMatter(s string) (string, string) { return splitYAMLFrontMatter(s) }
