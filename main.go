@@ -272,6 +272,15 @@ func splitClean(p string) []string {
 	return out
 }
 
+func stripLexiconLinks(s string) (string, int) {
+	count := 0
+	out := linkRe.ReplaceAllStringFunc(s, func(m string) string {
+		count++
+		return ""
+	})
+	return out, count
+}
+
 func buildAliasMap(files []string) (map[string]string, error) {
 	aliases := make(map[string]string)
 	for _, p := range files {
@@ -609,8 +618,12 @@ func doChapterJob(cfg Config, chapterDir string, aliasMap map[string]string, log
 				translitBody = ensureBlockIDAtEOL(gen, "kjv-transliteration")
 			}
 
-			// 4) Rebuild KJV paragraph ONLY from the base
-			kjvBody := ensureBlockIDAtEOL(base, "kjv")
+			// 4) Rebuild KJV paragraph ONLY from the base (with lexicon links stripped)
+			baseForKJV, rmK := stripLexiconLinks(base)
+			if rmK > 0 {
+				stats.linksRewritt.Add(int64(rmK))
+			}
+			kjvBody := ensureBlockIDAtEOL(baseForKJV, "kjv")
 
 			// 5) Compose: YAML + KJV + blank line + Transliteration
 			full := fm + kjvBody + "\n" + translitBody
@@ -630,7 +643,12 @@ func doChapterJob(cfg Config, chapterDir string, aliasMap map[string]string, log
 	relChapter, _ := filepath.Rel(cfg.InputParent, chapterFile)
 	outChapterDefault := filepath.Join(cfg.OutputParent, relChapter)
 	plannedDef, actionDef, err := writeBytesIfChanged(cfg, outChapterDefault, func() ([]byte, error) {
-		out := ensureEndsWithNewline(replacedKJV)
+		// Strip any [[H####]]/[[G####]] lexicon links from KJV chapter output
+		stripped, rm := stripLexiconLinks(replacedKJV)
+		if rm > 0 {
+			stats.linksRewritt.Add(int64(rm))
+		}
+		out := ensureEndsWithNewline(stripped)
 		return []byte(out), nil
 	}, false)
 	if err != nil {
@@ -645,7 +663,14 @@ func doChapterJob(cfg Config, chapterDir string, aliasMap map[string]string, log
 	translitChapterName := chapterBase + "-kjv-transliteration" + ext
 	outChapterTranslit := filepath.Join(cfg.OutputParent, chapterRelDir, translitChapterName)
 	plannedT, actionT, err := writeBytesIfChanged(cfg, outChapterTranslit, func() ([]byte, error) {
-		rebased, rew := rewriteChapterLinksToTranslit(replacedTranslit)
+		// NEW: alias any [[H####]]/[[G####]] that appear in chapter prose (e.g., Psalm headings)
+		aliased, rewA := rewriteLinks(replacedTranslit, aliasMap)
+		if rewA > 0 {
+			stats.linksRewritt.Add(int64(rewA))
+		}
+
+		// Existing: point chapter nav links at the transliteration variant
+		rebased, rew := rewriteChapterLinksToTranslit(aliased)
 		if rew > 0 {
 			stats.linksRewritt.Add(int64(rew))
 		}

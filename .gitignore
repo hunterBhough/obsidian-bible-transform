@@ -2,6 +2,7 @@ vault_modified
 KJV_Tagged_Lexicon
 Mikes_Bible_Study_Tools
 inputs/**/*
-# Keep zipfiles in inputs tracked
+outputs/**/*
+# Keep zipfiles in inputs/outputs tracked
 !inputs/*.zip
-outputs/**/**
+!outputs/*.zip
