@@ -67,6 +67,9 @@ var (
 	// Matches simple chapter links like [[Exodus 3]] or [[Exodus 3|→]] anywhere in a line
 	// (No dot/hash in target; ends with a number; avoids verse links like Genesis 2.1)
 	chapterLinkRe = regexp.MustCompile(`\[\[([^\]|#\n]+?\s\d+)(\|[^]]+)?\]\]`)
+	// Matches verse embeds like ![[Joshua 1.9]] or ![[Joshua 1:9]] (optionally with a letter like 1.9a)
+	// and preserves an alias if present: ![[Joshua 1.9|text]]
+	topicalVerseEmbedRe = regexp.MustCompile(`!\[\[([^\]|#\n]+?\s\d+[\.:]\d+[a-z]?)(\|[^]]+)?\]\]`)
 )
 
 type VerseBlock struct {
@@ -307,11 +310,22 @@ func doCopyJob(cfg Config, inputFile string, aliasMap map[string]string, logger 
 		ext := strings.ToLower(filepath.Ext(inputFile))
 		if ext == ".md" {
 			body := normalizeNewlines(string(b))
-			body = ensureEndsWithNewline(body)
+
+			// 1) Lexicon alias rewrites
 			newBody, rew := rewriteLinks(body, aliasMap)
 			if rew > 0 {
 				stats.linksRewritt.Add(int64(rew))
 			}
+
+			// 2) Verse embeds (![[Book 1.2]] or ![[Book 1:2]]) → add #^kjv anchor globally.
+			// This is safe outside Topical Bible because the regex skips links already anchored with `#^...`.
+			nb, rew2 := rewriteTopicalVerseEmbedsToKJV(newBody)
+			if rew2 > 0 {
+				stats.linksRewritt.Add(int64(rew2))
+				newBody = nb
+			}
+
+			newBody = ensureEndsWithNewline(newBody)
 			return []byte(newBody), nil
 		}
 		// Non-markdown: copy byte-for-byte
@@ -338,6 +352,23 @@ func rewriteChapterLinksToTranslit(s string) (string, int) {
 		}
 		count++
 		return "[[" + target + "-kjv-transliteration" + alias + "]]"
+	})
+	return out, count
+}
+
+// rewriteTopicalVerseEmbedsToKJV rewrites ![[Book 1.9]] (or with alias) to ![[Book 1.9#^kjv]].
+func rewriteTopicalVerseEmbedsToKJV(s string) (string, int) {
+	count := 0
+	out := topicalVerseEmbedRe.ReplaceAllStringFunc(s, func(m string) string {
+		sub := topicalVerseEmbedRe.FindStringSubmatch(m)
+		target := strings.TrimSpace(sub[1]) // e.g., "Joshua 1.9"
+		alias := sub[2]                     // e.g., "|Some text" or ""
+		// If already anchored to a block, leave as-is
+		if strings.Contains(target, "#^") {
+			return m
+		}
+		count++
+		return "![[" + target + "#^kjv" + alias + "]]"
 	})
 	return out, count
 }
@@ -924,6 +955,12 @@ func mirrorDirWithMarkdownRewrite(cfg Config, srcDir string, aliasMap map[string
 				newBody, rew := rewriteLinks(body, aliasMap)
 				if rew > 0 {
 					stats.linksRewritt.Add(int64(rew))
+				}
+				// Also add #^kjv to verse embeds if missing (safe no-op when already anchored)
+				nb, rew2 := rewriteTopicalVerseEmbedsToKJV(newBody)
+				if rew2 > 0 {
+					stats.linksRewritt.Add(int64(rew2))
+					newBody = nb
 				}
 				return []byte(newBody), nil
 			}
